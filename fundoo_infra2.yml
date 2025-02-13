@@ -1,0 +1,301 @@
+---
+- name: Create VPC and subnets with route tables
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - /home/ubuntu/fundoo_vars.yml
+  tasks:
+    - name: Creating VPC
+      amazon.aws.ec2_vpc_net:
+        name: "{{ vpc_name }}"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ vpc_region }}"
+        state: present
+      register: vpc
+
+    - name: Creating public subnet in AZ-1
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ sub1_cidr }}"
+        az: "{{ AZ_1 }}"
+        map_public: yes
+        state: present
+        tags:
+          Name: "{{ subnet_1_name }}"
+      register: subnet_1
+
+    - name: Creating public subnet in AZ-2
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ sub2_cidr }}"
+        az: "{{ AZ_2 }}"
+        map_public: yes
+        state: present
+        tags:
+          Name: "{{ subnet_2_name }}"
+      register: subnet_2
+
+    - name: Creating private subnet in AZ-2
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ sub3_cidr }}"
+        az: "{{ AZ_2 }}"
+        map_public: no
+        state: present
+        tags:
+          Name: "{{ subnet_3_name }}"
+      register: subnet_3
+
+    - name: Creating private subnet in AZ-3
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ sub4_cidr }}"
+        az: "{{ AZ_3 }}"
+        map_public: no
+        state: present
+        tags:
+          Name: "{{ subnet_4_name }}"
+      register: subnet_4
+
+    - name: Create and attach IGW to VPC
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc.vpc.id }}"
+        state: present
+        tags:
+          Name: "{{ igw_name }}"
+      register: igw
+
+    - name: Create and associate public route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ vpc_region }}"
+        tags:
+          Name: "{{ public_route_table_name }}"
+        subnets:
+          - "{{ subnet_1.subnet.id }}"
+          - "{{ subnet_2.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+      register: public_route_table
+
+    - name: Allocate an Elastic IP for NAT Gateway
+      amazon.aws.ec2_eip:
+        region: "{{ vpc_region }}"
+        state: present
+      register: nat_eip
+
+    - name: Create NAT Gateway
+      amazon.aws.ec2_vpc_nat_gateway:
+        subnet_id: "{{ subnet_2.subnet.id }}"
+        allocation_id: "{{ nat_eip.allocation_id }}"
+        region: "{{ vpc_region }}"
+        state: present
+        tags:
+          Name: "{{ nat_gateway_name }}"
+      register: nat_gateway
+
+    - name: Wait for NAT Gateway creation to complete
+      pause:
+        minutes: 6
+
+    - name: Get NAT Gateway details
+      amazon.aws.ec2_vpc_nat_gateway_info:
+        region: "{{ vpc_region }}"
+        filters:
+          subnet-id: "{{ subnet_2.subnet.id }}"
+      register: nat_gateway_info
+
+    - name: Debug NAT Gateway details
+      debug:
+        msg: "{{ nat_gateway_info }}"
+
+
+    - name: Create and associate private route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ vpc_region }}"
+        tags:
+          Name: "{{ private_route_table_name }}"
+        subnets:
+          - "{{ subnet_3.subnet.id }}"
+          - "{{ subnet_4.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            nat_gateway_id: "{{ nat_gateway.nat_gateway_id }}"
+      register: private_route_table
+
+- name: Launch ec2 with key pair and security group
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - /home/ubuntu/fundoo_vars.yml
+  tasks:
+
+    - name: create ec2 key pair
+      amazon.aws.ec2_key:
+        name: "{{ ec2_key_name }}"
+        region: "{{ vpc_region }}"
+        state: present
+        force:  true
+      register: ec2_key_pair
+
+    - name: Save the key to control node (if generated)
+      copy:
+        content: "{{ ec2_key_pair.key.private_key }}"
+        dest: "/home/ubuntu/.ssh/{{ ec2_key_name }}"
+        mode: '0600'
+      when: ec2_key_pair.key.private_key is defined
+
+
+    - name: Create security group for frontend instances
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name_F }}"
+        description: "Allow SSH and HTTP"
+        region: "{{ vpc_region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp 
+            ports:
+              - 80
+            cidr_ip: "0.0.0.0/0"
+        state: present
+      register: security_group_frontend
+
+    - name: Get frontend security group ID
+      set_fact:
+        security_group_id: "{{ security_group_frontend.group_id }}"
+
+    - name: Create security group for backend instances
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name_B }}"
+        description: "Allow SSH and 8000,5432"
+        region: "{{ vpc_region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp
+            ports:
+              - 8000
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp
+            ports:
+              - 5432
+            cidr_ip: "0.0.0.0/0"
+        state: present
+      register: security_group_backend
+
+    - name: Get backend security group ID
+      set_fact:
+        security_group_id: "{{ security_group_backend.group_id }}"
+
+    - name: Create security group for database instances 
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name_D }}"
+        description: "Allow SSH and 5432"
+        region: "{{ vpc_region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp
+            ports:
+              - 5432
+            cidr_ip: "0.0.0.0/0"
+        state: present
+      register: security_group_database
+
+    - name: Get security group ID
+      set_fact:
+        security_group_id: "{{ security_group_database.group_id }}"
+
+    - name: Launch frontend EC2 instance in specific subnet
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name_F }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        network_interfaces:
+          - assign_public_ip: true
+        key_name: "{{ ec2_key_name }}"
+        security_groups: "{{ security_group_frontend.group_id }}"
+        region: "{{ vpc_region }}"
+        subnet_id: "{{ subnet_1.subnet.id }}"
+        count: 1
+        wait: yes
+      register: F_ec2_instance
+
+    - name: Print the public IP of the frontend instance
+      debug:
+        msg: "Frontend Public IP of instance is: {{ F_ec2_instance.instances[0].public_ip_address }} | Frontend Private IP: {{ F_ec2_instance.instances[0].private_ip_address }} "
+
+    - name: Store frontend private IP in inventory file
+      lineinfile:
+        path: /home/ubuntu/inventory.ini
+        line: "ubuntu@{{ F_ec2_instance.instances[0].private_ip_address }} ansible_ssh_private_key_file=/home/ubuntu/.ssh/{{ ec2_key_name }}"
+        create: yes
+        insertafter: '\[frontend\]'
+
+
+    - name: Launch Backend EC2 instance in specific subnet
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name_B }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        network_interfaces:
+          - assign_public_ip: false
+        key_name: "{{ ec2_key_name }}"
+        security_groups: "{{ security_group_backend.group_id }}"
+        region: "{{ vpc_region }}"
+        subnet_id: "{{ subnet_3.subnet.id }}"
+        count: 1
+        wait: yes
+      register: B_ec2_instance
+
+    - name: Print the private IP of the backend instance
+      debug:
+        msg: "backend private IP of the instance is: {{ B_ec2_instance.instances[0].private_ip_address }}"
+
+    - name: Store backend private IP in inventory file
+      lineinfile:
+        path: /home/ubuntu/inventory.ini
+        line: "ubuntu@{{ B_ec2_instance.instances[0].private_ip_address }} ansible_ssh_private_key_file=/home/ubuntu/.ssh/{{ ec2_key_name }}"
+        create: yes
+        insertafter: '\[backend\]'
+
+    - name: Launch database EC2 instance in specific subnet
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name_D }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type2 }}"
+        network_interfaces:
+          - assign_public_ip: false
+        key_name: "{{ ec2_key_name }}"
+        security_groups: "{{ security_group_database.group_id }}"
+        region: "{{ vpc_region }}"
+        subnet_id: "{{ subnet_4.subnet.id }}"
+        count: 1
+        wait: yes
+      register: D_ec2_instance
+
+    - name: Print the private database IP of the instance
+      debug:
+        msg: "Database private IP of the instance is: {{ D_ec2_instance.instances[0].private_ip_address }} "
+
+    - name: Store database private IP in inventory file
+      lineinfile:
+        path: /home/ubuntu/inventory.ini
+        line: "ubuntu@{{ D_ec2_instance.instances[0].private_ip_address }} ansible_ssh_private_key_file=/home/ubuntu/.ssh/{{ ec2_key_name }}"
+        create: yes
+        insertafter: '\[database\]'
+
+
+
